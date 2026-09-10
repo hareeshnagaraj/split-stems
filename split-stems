@@ -1,0 +1,148 @@
+#!/bin/bash
+# split-stems <input-folder> [output-folder] [--max] [--flac]
+#
+# Output defaults to ~/Music/stems (override with $STEMS_OUT).
+#
+# Separates every audio file in a folder into stems that drop straight onto a
+# DAW grid: 24-bit WAV, detected BPM in the folder and every filename, and every
+# stem of a track identical in length so they stay locked to each other.
+#
+#   1. BS-Roformer    -> vocals, instrumental        (SDR 16.3 / 12.1)
+#   2. htdemucs_6s    -> drums, bass, guitar, piano, other
+#   3. MDX23C-DrumSep -> kick, snare, toms, hh, ride, crash   (--max only)
+#
+# --flac keeps the lossless intermediates instead of deleting them. WAV is the
+# default because FLAC carries no tempo hint, so Ableton auto-warps each stem
+# independently and guesses differently on sparse ones (bass, piano) than on
+# drums -- which pulls the stems apart from each other. Naming the tempo removes
+# the guess.
+#
+# Setup on a new machine:
+#   python3.11 -m venv <somewhere>/.venv-stems
+#   <somewhere>/.venv-stems/bin/pip install "audio-separator[cpu]==0.44.5" librosa
+#   export STEMS_VENV=<somewhere>/.venv-stems   # default: ~/.venv-stems
+
+set -uo pipefail
+
+VENV="${STEMS_VENV:-$HOME/.venv-stems}"
+SEP="$VENV/bin/audio-separator"
+PY="$VENV/bin/python"
+export PYTORCH_ENABLE_MPS_FALLBACK=1
+FFMPEG="$(command -v ffmpeg || echo /opt/homebrew/bin/ffmpeg)"
+FFPROBE="$(command -v ffprobe || echo /opt/homebrew/bin/ffprobe)"
+
+IN=""; OUT=""; MAX=0; KEEP_FLAC=0
+for a in "$@"; do
+  case "$a" in
+    --max)  MAX=1 ;;
+    --flac) KEEP_FLAC=1 ;;
+    *) if [ -z "$IN" ]; then IN="$a"; elif [ -z "$OUT" ]; then OUT="$a"; fi ;;
+  esac
+done
+# One place, always. Stems are library material, not downloads -- they get
+# reused across sessions and pulled into other projects, and a folder that also
+# holds installers and screenshots is not a library.
+OUT="${OUT:-${STEMS_OUT:-$HOME/Music/stems}}"
+
+if [ -z "$IN" ] || [ ! -d "$IN" ]; then
+  echo "usage: split-stems <input-folder> [output-folder] [--max] [--flac]"; exit 1
+fi
+for t in "$SEP" "$PY"; do
+  [ -x "$t" ] || { echo "missing: $t"; echo "set STEMS_VENV, or see the setup notes at the top of this script."; exit 1; }
+done
+[ -x "$FFMPEG" ] || { echo "ffmpeg not found (brew install ffmpeg)"; exit 1; }
+
+# --- BPM detection ------------------------------------------------------------
+# librosa reports whichever pulse it locks onto, which for a lot of funk and
+# disco is the half-time one -- Happiness came back 60.09 for a track that is
+# plainly 120. So prefer the candidate that lands in the range real records are
+# actually made in before trusting the raw number.
+cat > /tmp/.split-stems-bpm.py <<'PYEOF'
+import sys, warnings
+warnings.filterwarnings("ignore")
+import librosa, numpy as np
+try:
+    y, sr = librosa.load(sys.argv[1], sr=44100, mono=True)
+    tempo, _ = librosa.beat.beat_track(y=y, sr=sr, trim=False)
+    t = float(np.atleast_1d(tempo)[0])
+    if t <= 0: raise ValueError
+    cands = [t, t*2, t/2]
+    inrange = [c for c in cands if 90 <= c <= 160]
+    print(int(round(inrange[0] if inrange else t)))
+except Exception:
+    print(0)
+PYEOF
+
+tidy() {
+  # audio-separator names outputs "<track>_(Vocals)_<model>.flac". Pull the
+  # bracketed kind with parameter expansion, not sed -- a greedy .* regex
+  # silently matched nothing on the 6-stem model and left every file unrenamed.
+  local dir="$1" f n kind
+  for f in "$dir"/*.flac; do
+    [ -e "$f" ] || continue
+    n=$(basename "$f")
+    case "$n" in *_\(*\)_*) ;; *) continue ;; esac
+    kind="${n#*_(}"; kind="${kind%%)*}"
+    kind=$(printf '%s' "$kind" | tr '[:upper:]' '[:lower:]')
+    [ -n "$kind" ] || continue
+    [ "$kind.flac" = "$n" ] && continue
+    # BSD mv -n exits 0 even when it declines, so test first; the Roformer pass
+    # runs first and owns vocals.flac, htdemucs must not overwrite the better one.
+    if [ -e "$dir/$kind.flac" ]; then rm -f "$f"; else mv "$f" "$dir/$kind.flac"; fi
+  done
+}
+
+to_wav() {  # <dir> <bpm>
+  local dir="$1" bpm="$2" f stem
+  for f in "$dir"/*.flac; do
+    [ -e "$f" ] || continue
+    stem=$(basename "$f" .flac)
+    "$FFMPEG" -v error -y -i "$f" -c:a pcm_s24le -ar 44100 "$dir/${stem}_${bpm}bpm.wav"
+    [ "$KEEP_FLAC" = "1" ] || rm -f "$f"
+  done
+}
+
+shopt -s nullglob nocaseglob
+total=0
+for f in "$IN"/*.{wav,mp3,m4a,aif,aiff,flac}; do
+  [ -e "$f" ] || continue
+  case "$(basename "$f")" in *_[0-9]*bpm.wav) continue ;; esac   # don't re-split our own output
+  base=$(basename "${f%.*}")
+  echo "════ $base"
+  t0=$(date +%s)
+
+  bpm=$("$PY" /tmp/.split-stems-bpm.py "$f" 2>/dev/null || echo 0)
+  [ "$bpm" = "0" ] && { bpm="unknown"; echo "  ! BPM detection failed - set the tempo by ear"; } \
+                   || echo "  ♩ $bpm BPM"
+
+  d="$OUT/$base [${bpm}bpm]"; mkdir -p "$d"
+
+  "$SEP" "$f" --model_filename model_bs_roformer_ep_368_sdr_12.9628.ckpt \
+    --output_dir "$d" --output_format flac >/dev/null 2>&1 && tidy "$d" \
+    && echo "  ✓ vocals + instrumental" || echo "  ✗ roformer failed"
+
+  "$SEP" "$f" --model_filename htdemucs_6s.yaml \
+    --output_dir "$d" --output_format flac >/dev/null 2>&1 && tidy "$d" \
+    && echo "  ✓ drums bass guitar piano other" || echo "  ✗ htdemucs_6s failed"
+
+  if [ "$MAX" = "1" ] && [ -f "$d/drums.flac" ]; then
+    dd="$d/drumkit"; mkdir -p "$dd"
+    "$SEP" "$d/drums.flac" --model_filename MDX23C-DrumSep-aufr33-jarredou.ckpt \
+      --output_dir "$dd" --output_format flac >/dev/null 2>&1 && tidy "$dd" \
+      && to_wav "$dd" "$bpm" && echo "  ✓ kick snare toms hh ride crash" \
+      || echo "  ✗ drumsep failed"
+  fi
+
+  to_wav "$d" "$bpm"
+  echo "  $(( $(date +%s) - t0 ))s -> $d"
+  total=$((total+1))
+done
+
+echo
+echo "$total track(s) -> $OUT"
+[ "$total" -gt 0 ] && cat <<'TIP'
+
+In Ableton: set the project tempo to the BPM in the folder name, drag in all
+stems for that track together, then Warp them as one selection. Every stem of a
+track is identical in length, so once one sits on the grid they all do.
+TIP
