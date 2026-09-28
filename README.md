@@ -105,7 +105,12 @@ split-stems <folder> --flac              # keep lossless copies as well as WAV
 Set `STEMS_OUT` in your `~/.zshrc` if you want a different permanent home.
 
 The first run downloads the separation models (a few hundred MB) and will be
-slower than the rest. That happens once.
+slower than the rest. By default they land in `/tmp`, which macOS clears now
+and then; set `STEMS_MODELS` to a folder to download them only once:
+
+```bash
+echo 'export STEMS_MODELS="$HOME/.stems-models"' >> ~/.zshrc
+```
 
 ---
 

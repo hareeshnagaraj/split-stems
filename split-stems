@@ -21,11 +21,17 @@
 #   python3.11 -m venv <somewhere>/.venv-stems
 #   <somewhere>/.venv-stems/bin/pip install "audio-separator[cpu]==0.44.5" librosa
 #   export STEMS_VENV=<somewhere>/.venv-stems   # default: ~/.venv-stems
+#   export STEMS_MODELS=<somewhere>/models      # optional: keep downloaded models
+#                                               # (audio-separator's default is /tmp,
+#                                               # which macOS clears)
 
 set -uo pipefail
 
 VENV="${STEMS_VENV:-$HOME/.venv-stems}"
 SEP="$VENV/bin/audio-separator"
+# Empty unless STEMS_MODELS is set; the ${a[@]+...} form keeps bash 3.2 happy under set -u.
+MODELS_ARG=()
+[ -n "${STEMS_MODELS:-}" ] && { mkdir -p "$STEMS_MODELS"; MODELS_ARG=(--model_file_dir "$STEMS_MODELS"); }
 PY="$VENV/bin/python"
 export PYTORCH_ENABLE_MPS_FALLBACK=1
 FFMPEG="$(command -v ffmpeg || echo /opt/homebrew/bin/ffmpeg)"
@@ -117,17 +123,17 @@ for f in "$IN"/*.{wav,mp3,m4a,aif,aiff,flac}; do
 
   d="$OUT/$base [${bpm}bpm]"; mkdir -p "$d"
 
-  "$SEP" "$f" --model_filename model_bs_roformer_ep_368_sdr_12.9628.ckpt \
+  "$SEP" "$f" --model_filename model_bs_roformer_ep_368_sdr_12.9628.ckpt ${MODELS_ARG[@]+"${MODELS_ARG[@]}"} \
     --output_dir "$d" --output_format flac >/dev/null 2>&1 && tidy "$d" \
     && echo "  ✓ vocals + instrumental" || echo "  ✗ roformer failed"
 
-  "$SEP" "$f" --model_filename htdemucs_6s.yaml \
+  "$SEP" "$f" --model_filename htdemucs_6s.yaml ${MODELS_ARG[@]+"${MODELS_ARG[@]}"} \
     --output_dir "$d" --output_format flac >/dev/null 2>&1 && tidy "$d" \
     && echo "  ✓ drums bass guitar piano other" || echo "  ✗ htdemucs_6s failed"
 
   if [ "$MAX" = "1" ] && [ -f "$d/drums.flac" ]; then
     dd="$d/drumkit"; mkdir -p "$dd"
-    "$SEP" "$d/drums.flac" --model_filename MDX23C-DrumSep-aufr33-jarredou.ckpt \
+    "$SEP" "$d/drums.flac" --model_filename MDX23C-DrumSep-aufr33-jarredou.ckpt ${MODELS_ARG[@]+"${MODELS_ARG[@]}"} \
       --output_dir "$dd" --output_format flac >/dev/null 2>&1 && tidy "$dd" \
       && to_wav "$dd" "$bpm" && echo "  ✓ kick snare toms hh ride crash" \
       || echo "  ✗ drumsep failed"
