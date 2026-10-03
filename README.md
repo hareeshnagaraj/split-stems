@@ -162,6 +162,16 @@ points at the wrong place. Check `echo $STEMS_VENV` names a folder that exists.
 
 **`ffmpeg not found`** — `brew install ffmpeg`.
 
+**`✗ roformer failed` with "checkpoint file is corrupted"** — the model download
+got cut off (a ^C mid-run does it). Each pass now writes a `.<pass>.log` next to
+the stems. Finish the download in place:
+
+```
+cd /tmp/audio-separator-models
+curl -L -C - -O https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/model_bs_roformer_ep_368_sdr_12.9628.ckpt
+```
+
+
 **Install fails on wheels or build errors** — you're almost certainly not on
 Python 3.11. Check with `~/.venv-stems/bin/python --version`, and rebuild the
 venv with `python3.11` explicitly if not.
